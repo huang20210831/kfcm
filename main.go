@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -10,6 +13,7 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/protocol/describegroups"
 	"github.com/spf13/cobra"
 )
 
@@ -284,31 +288,29 @@ func printConsumerGroups(client *kafka.Client, withCoordinator bool) error {
 }
 
 func describeConsumerGroup(client *kafka.Client, name string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	resp, err := client.DescribeGroups(ctx, &kafka.DescribeGroupsRequest{GroupIDs: []string{name}})
+	groups, err := describeGroupsLenient(client, name)
 	if err != nil {
 		return fmt.Errorf("describe consumer group %q: %w", name, err)
 	}
-	if len(resp.Groups) == 0 {
+	if len(groups) == 0 {
 		return fmt.Errorf("consumer group %q not found", name)
 	}
 
-	for _, g := range resp.Groups {
-		if g.Error != nil {
-			return fmt.Errorf("describe consumer group %q: %w", name, g.Error)
+	for _, g := range groups {
+		if g.err != nil {
+			return fmt.Errorf("describe consumer group %q: %w", name, g.err)
 		}
-		lagByPartition, err := fetchGroupLags(client, g.GroupID, g.Members)
+		lagByPartition, err := fetchGroupLags(client, g.groupID, g.members)
 		if err != nil {
 			return err
 		}
 
-		fmt.Printf("GROUP\t%s\n", g.GroupID)
-		fmt.Printf("STATE\t%s\n", g.GroupState)
+		fmt.Printf("GROUP\t%s\n", g.groupID)
+		fmt.Printf("STATE\t%s\n", g.state)
 
 		w := newTableWriter()
 		fmt.Fprintln(w, "MEMBER_ID\tCLIENT_ID\tCLIENT_HOST\tASSIGNMENTS\tLAG")
-		for _, m := range g.Members {
+		for _, m := range g.members {
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", m.MemberID, m.ClientID, m.ClientHost, formatAssignments(m.MemberAssignments.Topics), memberLagText(m.MemberAssignments.Topics, lagByPartition))
 		}
 		if err := w.Flush(); err != nil {
@@ -316,6 +318,130 @@ func describeConsumerGroup(client *kafka.Client, name string) error {
 		}
 	}
 	return nil
+}
+
+type consumerGroupDescription struct {
+	groupID string
+	state   string
+	members []kafka.DescribeGroupsResponseMember
+	err     error
+}
+
+func describeGroupsLenient(client *kafka.Client, groupID string) ([]consumerGroupDescription, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	transport := client.Transport
+	if transport == nil {
+		transport = kafka.DefaultTransport
+	}
+	resp, err := transport.RoundTrip(ctx, client.Addr, &describegroups.Request{Groups: []string{groupID}})
+	if err != nil {
+		return nil, err
+	}
+	apiResp := resp.(*describegroups.Response)
+	groups := make([]consumerGroupDescription, 0, len(apiResp.Groups))
+	for _, apiGroup := range apiResp.Groups {
+		group := consumerGroupDescription{
+			groupID: apiGroup.GroupID,
+			state:   apiGroup.GroupState,
+		}
+		if apiGroup.ErrorCode != 0 {
+			group.err = kafka.Error(apiGroup.ErrorCode)
+		}
+		for _, member := range apiGroup.Members {
+			assignments, err := decodeAssignmentsLenient(member.MemberAssignment)
+			if err != nil {
+				return nil, fmt.Errorf("decode member assignment for %s: %w", member.MemberID, err)
+			}
+			group.members = append(group.members, kafka.DescribeGroupsResponseMember{
+				MemberID:          member.MemberID,
+				ClientID:          member.ClientID,
+				ClientHost:        member.ClientHost,
+				MemberAssignments: kafka.DescribeGroupsResponseAssignments{Topics: assignments},
+			})
+		}
+		groups = append(groups, group)
+	}
+	return groups, nil
+}
+
+func decodeAssignmentsLenient(raw []byte) ([]kafka.GroupMemberTopic, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	r := bytes.NewReader(raw)
+	if _, err := readInt16Value(r); err != nil {
+		return nil, err
+	}
+	count, err := readInt32Value(r)
+	if err != nil {
+		return nil, err
+	}
+	if count < 0 {
+		return nil, nil
+	}
+	if count > 100000 {
+		return nil, fmt.Errorf("invalid assignment topic count %d", count)
+	}
+	assignments := make([]kafka.GroupMemberTopic, 0, count)
+	for i := int32(0); i < count; i++ {
+		topic, err := readStringValue(r)
+		if err != nil {
+			return nil, err
+		}
+		partitionCount, err := readInt32Value(r)
+		if err != nil {
+			return nil, err
+		}
+		if partitionCount < 0 {
+			continue
+		}
+		if partitionCount > 1000000 {
+			return nil, fmt.Errorf("invalid assignment partition count %d", partitionCount)
+		}
+		item := kafka.GroupMemberTopic{Topic: topic, Partitions: make([]int, 0, partitionCount)}
+		for j := int32(0); j < partitionCount; j++ {
+			partition, err := readInt32Value(r)
+			if err != nil {
+				return nil, err
+			}
+			item.Partitions = append(item.Partitions, int(partition))
+		}
+		assignments = append(assignments, item)
+	}
+	// Ignore remaining bytes: they are user data or newer protocol extensions.
+	return assignments, nil
+}
+
+func readInt16Value(r io.Reader) (int16, error) {
+	var v int16
+	err := binary.Read(r, binary.BigEndian, &v)
+	return v, err
+}
+
+func readInt32Value(r io.Reader) (int32, error) {
+	var v int32
+	err := binary.Read(r, binary.BigEndian, &v)
+	return v, err
+}
+
+func readStringValue(r *bytes.Reader) (string, error) {
+	length, err := readInt16Value(r)
+	if err != nil {
+		return "", err
+	}
+	if length < 0 {
+		return "", nil
+	}
+	if int64(length) > int64(r.Len()) {
+		return "", fmt.Errorf("invalid string length %d", length)
+	}
+	buf := make([]byte, length)
+	_, err = io.ReadFull(r, buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
 }
 
 type topicPartition struct {
