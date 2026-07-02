@@ -48,7 +48,7 @@ func newClusterCommand() *cobra.Command {
 		Short: "Manage Kafka clusters",
 		RunE:  showHelp,
 	}
-	cmd.AddCommand(newClusterAddCommand(), newClusterListCommand())
+	cmd.AddCommand(newClusterAddCommand(), newClusterListCommand(), newClusterDeleteCommand())
 	return cmd
 }
 
@@ -87,6 +87,64 @@ func newAddTopicCommand() *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "topic name")
 	cmd.Flags().IntVar(&partitions, "partitions", 1, "topic partition count")
 	cmd.Flags().IntVar(&replicationFactor, "replication-factor", 1, "topic replication factor")
+	return cmd
+}
+
+func newClusterDeleteCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "delete",
+		Short: "Delete Kafka cluster resources",
+		RunE:  showHelp,
+	}
+	cmd.AddCommand(newDeleteTopicCommand(), newDeleteConsumerGroupCommand())
+	return cmd
+}
+
+func newDeleteTopicCommand() *cobra.Command {
+	var name string
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:     "topic <broker-ip:port>",
+		Aliases: []string{"topics"},
+		Short:   "Delete a Kafka topic",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(name) == "" {
+				return fmt.Errorf("--name is required")
+			}
+			if !yes {
+				return fmt.Errorf("refusing to delete topic %q without --yes", name)
+			}
+			return deleteTopic(args[0], name)
+		},
+	}
+	cmd.Flags().StringVar(&name, "name", "", "topic name")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm deletion")
+	return cmd
+}
+
+func newDeleteConsumerGroupCommand() *cobra.Command {
+	var name string
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:     "consumergroup <broker-ip:port>",
+		Aliases: []string{"consumergroups", "consumer-group", "consumer-groups"},
+		Short:   "Delete a Kafka consumer group",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(name) == "" {
+				return fmt.Errorf("--name is required")
+			}
+			if !yes {
+				return fmt.Errorf("refusing to delete consumer group %q without --yes", name)
+			}
+			return deleteConsumerGroup(args[0], name)
+		},
+	}
+	cmd.Flags().StringVar(&name, "name", "", "consumer group name")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm deletion")
 	return cmd
 }
 
@@ -182,6 +240,38 @@ func newDebugDescribeGroupCommand() *cobra.Command {
 
 func showHelp(cmd *cobra.Command, args []string) error {
 	return cmd.Help()
+}
+
+func deleteTopic(broker string, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	client := newClient(broker)
+
+	resp, err := client.DeleteTopics(ctx, &kafka.DeleteTopicsRequest{Topics: []string{name}})
+	if err != nil {
+		return fmt.Errorf("delete topic %q: %w", name, err)
+	}
+	if topicErr := resp.Errors[name]; topicErr != nil {
+		return fmt.Errorf("delete topic %q: %w", name, topicErr)
+	}
+	fmt.Printf("deleted topic %q\n", name)
+	return nil
+}
+
+func deleteConsumerGroup(broker string, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	client := newClient(broker)
+
+	resp, err := client.DeleteGroups(ctx, &kafka.DeleteGroupsRequest{GroupIDs: []string{name}})
+	if err != nil {
+		return fmt.Errorf("delete consumer group %q: %w", name, err)
+	}
+	if groupErr := resp.Errors[name]; groupErr != nil {
+		return fmt.Errorf("delete consumer group %q: %w", name, groupErr)
+	}
+	fmt.Printf("deleted consumer group %q\n", name)
+	return nil
 }
 
 func createTopic(broker string, name string, partitions int, replicationFactor int) error {
