@@ -1,4 +1,4 @@
-# AGENT.md
+# AGENTS.md
 
 这个文件给后续维护本项目的 AI Agent 或开发者看。
 
@@ -6,10 +6,20 @@
 
 `kfcm` 是一个 Kafka 集群管理 CLI，使用 Go 编写。
 
-主要入口文件：
+主要代码文件：
 
 ```text
-main.go
+main.go                  程序入口
+root_command.go          根命令
+cluster_command.go       cluster 命令树
+debug_command.go         debug 命令和输出
+topic.go                 topic 操作
+broker.go                broker 查询
+consumer_group.go        consumer group 查询和删除
+consumer_protocol.go     consumer metadata/assignment 解析
+lag.go                   LAG 计算
+kafka_client.go          Kafka client 和 metadata 查询
+output.go                表格与格式化输出
 ```
 
 依赖管理：
@@ -52,7 +62,7 @@ kfcm
 
 ## 开发约定
 
-1. 尽量保持单文件简单实现，当前主要逻辑都在 `main.go`。
+1. 项目采用同一个 `package main` 下按职责拆分文件，避免把无关逻辑继续堆到 `main.go`。
 2. 新增命令优先接入 Cobra command tree。
 3. 表格输出使用 `newTableWriter()`，不要直接用裸 `\t` 输出表格。
 4. 删除、变更类操作必须加确认参数，比如 `--yes`。
