@@ -78,7 +78,7 @@ go test ./...
 Linux amd64：
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o kfcm-linux-amd64 .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /usr/local/bin/kfcm .
 ```
 
 Windows 本地临时检查：
